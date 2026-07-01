@@ -101,11 +101,17 @@ def select_transmission() -> tuple[str, dict]:
     a.metric("Propulsion", tx["propulsion"])
     b.metric("Gearbox", tx["gearbox"])
     c.metric("Operation modes", len(tx["modes"]))
+    templates = avl.templates_for(transmission)
     with st.expander(f"🔧 Assigned configuration — **{transmission} · {tx['label']}**", expanded=False):
         c1, c2, c3 = st.columns(3)
         c1.markdown("**Enabled operation modes**\n\n" + "\n".join(f"- {m}" for m in tx["modes"]))
         c2.markdown("**Powertrain features**\n\n" + "\n".join(f"- {f}" for f in tx["features"]))
         c3.markdown("**Relevant DRIVE channels**\n\n" + "\n".join(f"- {ch}" for ch in avl.relevant_channels(transmission)))
+        st.markdown(f"**Loaded operation-mode templates ({len(templates)}) — {transmission} family**")
+        st.dataframe(pd.DataFrame([
+            {"Template": e["template"], "Sub-operation mode": e["label"],
+             "Base mode": e["mode"], "Default weight": e["weight"]} for e in templates]),
+            use_container_width=True, hide_index=True)
     return transmission, tx
 
 
@@ -137,44 +143,64 @@ def sidebar_config(transmission: str, tx: dict) -> tuple[dict, dict]:
     return cfg, avl.BRAND_DNA[brand]
 
 
-def weight_editor() -> tuple[dict, dict]:
-    """Live AVL weight-tree editor with JSON import/export."""
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("⚖️ Weight-tree editor (AVL Weight Editor)"):
-        if "mode_weights" not in st.session_state:
-            st.session_state.mode_weights = avl.default_mode_weights()
-        if "criteria_weights" not in st.session_state:
-            st.session_state.criteria_weights = avl.default_criteria_weights()
+def weight_editor(transmission: str) -> tuple[dict, dict]:
+    """Transmission-specific AVL weight-tree editor.
 
-        up = st.file_uploader("Import weights (JSON)", type=["json"], key="weights_up")
+    Loads the selected transmission's operation-mode templates (the ``.ect``
+    family), lets the engineer weight each one (0–5), and rolls those up into the
+    operation-mode weights used by the DRIVE-Rating aggregation. Criteria weights
+    are global. Supports JSON import/export.
+    """
+    st.sidebar.markdown("---")
+    templates = avl.templates_for(transmission)
+    st.session_state.setdefault("template_weights", {})
+    if transmission not in st.session_state.template_weights:
+        st.session_state.template_weights[transmission] = avl.default_template_weights(transmission)
+    st.session_state.setdefault("criteria_weights", avl.default_criteria_weights())
+    tw = st.session_state.template_weights[transmission]
+
+    with st.sidebar.expander(f"⚖️ Weight-tree editor — {transmission} templates"):
+        up = st.file_uploader("Import weights (JSON)", type=["json"], key=f"weights_up_{transmission}")
         if up is not None:
             try:
                 data = json.load(up)
-                st.session_state.mode_weights.update(data.get("mode_weights", {}))
+                imported = data.get("template_weights", {})
+                tw.update(imported.get(transmission, imported if not any(k in avl.TEMPLATE_CATALOG for k in imported) else {}))
                 st.session_state.criteria_weights.update(data.get("criteria_weights", {}))
                 st.success("Weights imported.")
             except Exception as e:
                 st.error(f"Invalid weights file: {e}")
-
-        if st.button("Reset to AVL defaults"):
-            st.session_state.mode_weights = avl.default_mode_weights()
+        if st.button("Reset to AVL defaults", key=f"reset_{transmission}"):
+            st.session_state.template_weights[transmission] = avl.default_template_weights(transmission)
             st.session_state.criteria_weights = avl.default_criteria_weights()
+            tw = st.session_state.template_weights[transmission]
 
-        st.caption("Criteria weights (1-5)")
+        st.caption(f"{len(templates)} operation-mode templates loaded for **{transmission}** (weights 0–5). "
+                   "Each base mode takes the strongest template weight.")
+        groups: dict[str, list] = {}
+        for e in templates:
+            groups.setdefault(e["mode"], []).append(e)
+        for mode, entries in groups.items():
+            st.markdown(f"**{mode}**")
+            for e in entries:
+                tw[e["template"]] = st.slider(e["label"], 0, 5, int(tw.get(e["template"], e["weight"])),
+                                              key=f"tw_{e['template']}")
+
+        st.caption("Criteria weights (0–5)")
         for c, meta in avl.CRITERIA_META.items():
             st.session_state.criteria_weights[c] = st.slider(
                 meta["label"], 0, 5, int(st.session_state.criteria_weights.get(c, meta["weight"])),
                 key=f"cw_{c}")
-        st.caption("Operation-mode weights (1-5)")
-        for m in avl.MODE_WEIGHTS:
-            st.session_state.mode_weights[m] = st.slider(
-                m, 0, 5, int(st.session_state.mode_weights.get(m, 3)), key=f"mw_{m}")
 
         st.download_button("Export weights (JSON)",
-                           data=json.dumps({"mode_weights": st.session_state.mode_weights,
+                           data=json.dumps({"transmission": transmission,
+                                            "template_weights": {transmission: tw},
                                             "criteria_weights": st.session_state.criteria_weights}, indent=2),
-                           file_name="avldrive_weights.json", mime="application/json")
-    return st.session_state.mode_weights, st.session_state.criteria_weights
+                           file_name=f"avldrive_weights_{transmission}.json", mime="application/json")
+
+    mode_weights = avl.mode_weights_from_templates(transmission, tw)
+    st.session_state.mode_weights = mode_weights
+    return mode_weights, st.session_state.criteria_weights
 
 
 # =============================================================================
@@ -545,7 +571,7 @@ def main():
 
     transmission, tx = select_transmission()
     cfg, dna = sidebar_config(transmission, tx)
-    mode_weights, criteria_weights = weight_editor()
+    mode_weights, criteria_weights = weight_editor(transmission)
 
     st.sidebar.markdown("---")
     uploads = st.sidebar.file_uploader("Import measurement(s) (.mf4, .dat)",

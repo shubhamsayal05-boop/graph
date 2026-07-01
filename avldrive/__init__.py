@@ -9,7 +9,7 @@ the interactive UI.
 from __future__ import annotations
 
 from . import (advisor, benchmark, compare, config, criteria, dsp,
-               operation_modes, spectrum, verification)
+               operation_modes, spectrum, templates, verification)
 from .advisor import (CALIBRATION_KB, improvement_opportunities, target_gaps)
 from .assessment import aggregate_dr, assess
 from .benchmark import (fingerprint, library_from_json, library_to_json,
@@ -26,13 +26,18 @@ from .pipeline import (AssessmentResult, MissingChannelsError, list_channels,
                        load_measurement_from_bytes, run_assessment)
 from .reporting import build_summary_report
 from .spectrum import compute_band_spectrum, interpret_surge_source
+from .templates import (TEMPLATE_CATALOG, default_template_weights,
+                        load_catalog_from_dir, mode_weights_from_templates,
+                        parse_ect_filename, templates_for)
 from .verification import VERIFICATION_PRESETS, issue_log, verify
 
 __version__ = "1.1.0"
 
 __all__ = [
     "config", "dsp", "criteria", "operation_modes", "spectrum",
-    "advisor", "verification", "benchmark", "compare",
+    "advisor", "verification", "benchmark", "compare", "templates",
+    "TEMPLATE_CATALOG", "templates_for", "default_template_weights",
+    "mode_weights_from_templates", "parse_ect_filename", "load_catalog_from_dir",
     "TRANSMISSION_CONFIG", "BRAND_DNA", "MODE_WEIGHTS", "MODE_CRITERIA", "CRITERIA_META",
     "VehicleConfig", "relevant_channels", "default_mode_weights", "default_criteria_weights",
     "resolve_channels", "resolve_channel_names", "build_calculated_channels", "detect_events",
