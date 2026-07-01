@@ -1,0 +1,75 @@
+"""High-level orchestration: measurement import and full assessment.
+
+Keeps Streamlit out of the core so the pipeline is testable and reusable.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+from dataclasses import dataclass, field
+
+import pandas as pd
+from asammdf import MDF
+
+from .assessment import assess
+from .channels import build_calculated_channels, resolve_channels
+from .config import FS, REQUIRED_LOGICAL
+from .operation_modes import detect_events
+
+
+class MissingChannelsError(RuntimeError):
+    """Raised when the measurement lacks the required DRIVE channels."""
+
+    def __init__(self, missing, detected):
+        self.missing = missing
+        self.detected = detected
+        super().__init__(f"Missing required DRIVE channels: {missing}. Detected: {detected}")
+
+
+def load_measurement(path: str, cfg: dict):
+    """Import an .mf4/.dat file, resample to the 100 Hz grid, rename to AVL
+    logical channels and build calculated channels. Returns ``(df, found)``."""
+    mdf = MDF(path)
+    found = resolve_channels(mdf)
+    missing = [c for c in REQUIRED_LOGICAL if c not in found]
+    if missing:
+        raise MissingChannelsError(missing, sorted(found.keys()))
+    res = mdf.filter(list(found.values())).resample(raster=1.0 / FS)
+    df = res.to_dataframe().rename(columns={raw: lg for lg, raw in found.items()})
+    df = df.reset_index().rename(columns={"index": "timestamp", "time": "timestamp"})
+    if "timestamp" not in df.columns:
+        df = df.rename(columns={df.columns[0]: "timestamp"})
+    df = build_calculated_channels(df, cfg)
+    return df, found
+
+
+def load_measurement_from_bytes(data: bytes, suffix: str, cfg: dict):
+    """Convenience wrapper for in-memory uploads."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        return load_measurement(tmp_path, cfg)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@dataclass
+class AssessmentResult:
+    overall: float | None
+    mode_results: dict
+    events: list
+    found: dict
+    duration_s: float
+    n_samples: int
+
+
+def run_assessment(df, enabled_modes, cfg: dict, dna: dict,
+                   mode_weights=None, criteria_weights=None) -> AssessmentResult:
+    """Detect operation modes and compute the DRIVE-Rating tree."""
+    events = detect_events(df, enabled_modes, cfg)
+    overall, mode_results = assess(df, events, dna, mode_weights, criteria_weights)
+    duration = float(df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]) if len(df) else 0.0
+    return AssessmentResult(overall=overall, mode_results=mode_results, events=events,
+                            found={}, duration_s=duration, n_samples=len(df))
