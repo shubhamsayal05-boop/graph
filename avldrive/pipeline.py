@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -26,16 +27,53 @@ class MissingChannelsError(RuntimeError):
         super().__init__(f"Missing required DRIVE channels: {missing}. Detected: {detected}")
 
 
+def _close_quietly(obj):
+    """Close an asammdf MDF (or similar) if it exposes ``close``, ignoring errors."""
+    try:
+        if obj is not None and hasattr(obj, "close"):
+            obj.close()
+    except Exception:
+        pass
+
+
+def _remove_quietly(path: str, retries: int = 5, delay: float = 0.2):
+    """Best-effort file removal. On Windows a handle may linger briefly after
+    close, so retry a few times before giving up (never raises)."""
+    for _ in range(retries):
+        try:
+            if not os.path.exists(path):
+                return
+            os.remove(path)
+            return
+        except (PermissionError, OSError):
+            time.sleep(delay)
+
+
 def load_measurement(path: str, cfg: dict):
     """Import an .mf4/.dat file, resample to the 100 Hz grid, rename to AVL
-    logical channels and build calculated channels. Returns ``(df, found)``."""
+    logical channels and build calculated channels. Returns ``(df, found)``.
+
+    The source ``MDF`` (and intermediate filtered/resampled objects) are always
+    closed before returning so the underlying file is released — critical on
+    Windows, where an open handle blocks deletion (WinError 32).
+    """
     mdf = MDF(path)
-    found = resolve_channels(mdf)
-    missing = [c for c in REQUIRED_LOGICAL if c not in found]
-    if missing:
-        raise MissingChannelsError(missing, sorted(found.keys()))
-    res = mdf.filter(list(found.values())).resample(raster=1.0 / FS)
-    df = res.to_dataframe().rename(columns={raw: lg for lg, raw in found.items()})
+    filtered = res = None
+    try:
+        found = resolve_channels(mdf)
+        missing = [c for c in REQUIRED_LOGICAL if c not in found]
+        if missing:
+            raise MissingChannelsError(missing, sorted(found.keys()))
+        filtered = mdf.filter(list(found.values()))
+        res = filtered.resample(raster=1.0 / FS)
+        # ``.copy()`` materializes the data so it stays valid after the MDF (and
+        # any backing memory-maps) are closed below.
+        df = res.to_dataframe().rename(columns={raw: lg for lg, raw in found.items()}).copy()
+    finally:
+        _close_quietly(res)
+        _close_quietly(filtered)
+        _close_quietly(mdf)
+
     df = df.reset_index().rename(columns={"index": "timestamp", "time": "timestamp"})
     if "timestamp" not in df.columns:
         df = df.rename(columns={df.columns[0]: "timestamp"})
@@ -44,15 +82,15 @@ def load_measurement(path: str, cfg: dict):
 
 
 def load_measurement_from_bytes(data: bytes, suffix: str, cfg: dict):
-    """Convenience wrapper for in-memory uploads."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
+    """Convenience wrapper for in-memory uploads. Writes a temp file, imports it
+    and always cleans up (best-effort, Windows-safe)."""
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix or ".mf4")
     try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(data)
         return load_measurement(tmp_path, cfg)
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        _remove_quietly(tmp_path)
 
 
 @dataclass
