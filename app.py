@@ -5,6 +5,8 @@ import numpy as np
 from scipy.signal import butter, filtfilt, welch
 import plotly.graph_objects as go
 import os
+from io import BytesIO
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # 1. CHANNEL LAYOUT CONFIGURATION
@@ -18,21 +20,23 @@ CHANNEL_MAPPING = {
 }
 
 # -----------------------------------------------------------------------------
-# 1b. VEHICLE MODE CALIBRATION PROFILES
+# 1b. VEHICLE CONFIGURATION PROFILES (multi-vehicle baselines)
 # -----------------------------------------------------------------------------
 # Each profile defines how aggressively RMS error and response delay are
-# penalised when translating into the 1-10 rating scale. "Sport" is the most
-# demanding target (small faults cost more points) while "Eco" is the most
-# forgiving. The "delay" coefficient is tuned so that a 300 ms response delay
-# scores 8.5/10 in Eco, 5.5/10 in Comfort and 3.0/10 in Sport.
+# penalised when translating into the 1-10 rating scale. A "Sports Car" holds
+# the sharpest target (small faults cost more points, response delay is
+# punished severely), a "Luxury Sedan" is a balanced comfort-biased baseline,
+# and an "Eco EV" is the most forgiving on latency (heavier / efficiency-first
+# calibration where a longer, smoother torque build-up is acceptable).
 #   score_delay = 10 - mean_delay_s * delay_coeff
-#     Eco:     10 - 0.3 * 5.0000 = 8.5
-#     Comfort: 10 - 0.3 * 15.000 = 5.5
-#     Sport:   10 - 0.3 * 23.333 = 3.0
+# Reference points at a 200 ms delay:
+#     Luxury Sedan: 10 - 0.2 * 12.0 = 7.6
+#     Sports Car:   10 - 0.2 * 26.0 = 4.8   (delay punished far more severely)
+#     Eco EV:       10 - 0.2 *  6.0 = 8.8
 MODE_PROFILES = {
-    "Comfort": {"delay": 15.0, "surge": 4.5, "lf": 3.5, "hf": 2.5},
-    "Eco": {"delay": 5.0, "surge": 3.0, "lf": 2.5, "hf": 2.0},
-    "Sport": {"delay": 23.3333, "surge": 6.5, "lf": 5.0, "hf": 4.0},
+    "Luxury Sedan": {"delay": 12.0, "surge": 4.5, "lf": 3.5, "hf": 2.5},
+    "Sports Car": {"delay": 26.0, "surge": 6.5, "lf": 5.0, "hf": 4.0},
+    "Eco EV": {"delay": 6.0, "surge": 3.5, "lf": 3.0, "hf": 2.5},
 }
 
 st.set_page_config(page_title="AI Automotive Calibration Lab", layout="wide")
@@ -82,20 +86,19 @@ def process_advanced_metrics(df, fs=100.0):
     
     return df
 
-def compute_surge_spectrum(surge_signal, fs=100.0, band=(0.5, 2.0)):
-    """Runs a Welch periodogram over the surge tracking array and isolates the
-    dominant frequency peak inside the surge band (default 0.5-2.0 Hz).
+def compute_band_spectrum(signal_data, fs=100.0, band=(0.5, 2.0)):
+    """Runs a Welch periodogram over a filtered signal and isolates the
+    dominant frequency peak inside the requested band.
 
-    Returns a dict with the full spectrum (for plotting), the dominant peak
-    frequency/power inside the band, and a human-readable interpretation of the
-    likely mechanical/electrical source of the chugging.
+    Returns a dict with the full spectrum (for plotting) and the dominant peak
+    frequency/power inside the band, or ``None`` if the slice is too short.
     """
-    signal = np.asarray(surge_signal, dtype=float)
+    signal = np.asarray(signal_data, dtype=float)
     signal = signal[np.isfinite(signal)]
 
     # Choose a segment length that gives good low-frequency resolution while
     # still fitting within the captured drive slice. A larger nperseg tightens
-    # the frequency resolution around the 0.5-2.0 Hz surge band.
+    # the frequency resolution around the band of interest.
     nperseg = int(min(len(signal), 1024))
     if nperseg < 16:
         return None
@@ -110,37 +113,147 @@ def compute_surge_spectrum(surge_signal, fs=100.0, band=(0.5, 2.0)):
     band_freqs = freqs[band_mask]
     band_psd = psd[band_mask]
     peak_idx = int(np.argmax(band_psd))
-    dominant_freq = float(band_freqs[peak_idx])
-    dominant_power = float(band_psd[peak_idx])
-
-    # Rough physical interpretation of the dominant surge frequency. Low-order
-    # combustion firing / lugging surges tend to sit near the bottom of the
-    # band, whereas faster limit-cycle oscillations from an electric motor
-    # controller damping loop tend to push toward the top of the band.
-    if dominant_freq < 1.0:
-        source = (
-            "Low-frequency chugging (< 1.0 Hz) — consistent with engine "
-            "combustion firing / lugging loops or coarse driveline lash."
-        )
-    elif dominant_freq < 1.5:
-        source = (
-            "Mid-band surge (1.0-1.5 Hz) — mixed powertrain source; inspect "
-            "both combustion torque delivery and controller damping."
-        )
-    else:
-        source = (
-            "Faster surge oscillation (> 1.5 Hz) — consistent with an electric "
-            "motor / e-drive controller damping (limit-cycle) loop."
-        )
 
     return {
         "freqs": freqs,
         "psd": psd,
         "band": band,
-        "dominant_freq": dominant_freq,
-        "dominant_power": dominant_power,
-        "source": source,
+        "dominant_freq": float(band_freqs[peak_idx]),
+        "dominant_power": float(band_psd[peak_idx]),
     }
+
+def interpret_surge_source(dominant_freq):
+    """Rough physical interpretation of the dominant surge frequency. Low-order
+    combustion firing / lugging surges tend to sit near the bottom of the band,
+    whereas faster limit-cycle oscillations from an electric motor controller
+    damping loop tend to push toward the top of the band."""
+    if dominant_freq < 1.0:
+        return (
+            "Low-frequency chugging (< 1.0 Hz) — consistent with engine "
+            "combustion firing / lugging loops or coarse driveline lash."
+        )
+    if dominant_freq < 1.5:
+        return (
+            "Mid-band surge (1.0-1.5 Hz) — mixed powertrain source; inspect "
+            "both combustion torque delivery and controller damping."
+        )
+    return (
+        "Faster surge oscillation (> 1.5 Hz) — consistent with an electric "
+        "motor / e-drive controller damping (limit-cycle) loop."
+    )
+
+def render_psd_block(container, signal_data, band, title, color, fs=100.0, caption_fn=None):
+    """Renders a PSD (Welch) sub-chart with the dominant band frequency called
+    out as text above the plot. Returns the dominant frequency (Hz) or None."""
+    spec = compute_band_spectrum(signal_data, fs=fs, band=band)
+    low, high = band
+    if spec is None:
+        container.info(f"{title}: slice too short to resolve a dominant frequency peak.")
+        return None
+
+    dom = spec["dominant_freq"]
+    # Dominant frequency stated as text directly above the chart.
+    container.markdown(
+        f"**{title} — dominant frequency: `{dom:.2f} Hz`** "
+        f"(band {low:g}–{high:g} Hz, PSD peak {spec['dominant_power']:.3e} (m/s²)²/Hz)"
+    )
+    if caption_fn is not None:
+        container.caption(caption_fn(dom))
+
+    band_mask = (spec["freqs"] >= low) & (spec["freqs"] <= high)
+    fig_psd = go.Figure()
+    fig_psd.add_trace(go.Scatter(
+        x=spec["freqs"][band_mask],
+        y=spec["psd"][band_mask],
+        name=f"{title} PSD",
+        line=dict(color=color),
+        fill="tozeroy",
+    ))
+    fig_psd.add_vline(
+        x=dom,
+        line=dict(color="crimson", dash="dash"),
+        annotation_text=f"{dom:.2f} Hz",
+        annotation_position="top",
+    )
+    fig_psd.update_layout(
+        title=f"{title} Power Spectral Density (Welch)",
+        xaxis_title="Frequency (Hz)",
+        yaxis_title="PSD (m/s²)²/Hz",
+        height=320,
+    )
+    container.plotly_chart(fig_psd, use_container_width=True)
+    return dom
+
+def build_summary_report(meta, scores):
+    """Builds an AVL-style executive summary report. Returns a
+    ``(bytes, mime, extension)`` tuple. Uses reportlab for a PDF when available,
+    otherwise falls back to a plain-text report so the export always works."""
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.units import cm
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        )
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer, pagesize=A4,
+            leftMargin=2 * cm, rightMargin=2 * cm,
+            topMargin=2 * cm, bottomMargin=2 * cm,
+        )
+        styles = getSampleStyleSheet()
+        story = [
+            Paragraph("AVL-Style Executive Calibration Summary", styles["Title"]),
+            Spacer(1, 6),
+            Paragraph(f"Generated: {generated}", styles["Normal"]),
+            Spacer(1, 12),
+            Paragraph("File Metadata", styles["Heading2"]),
+        ]
+
+        meta_rows = [["Field", "Value"]] + [[k, str(v)] for k, v in meta.items()]
+        meta_table = Table(meta_rows, colWidths=[6 * cm, 9 * cm])
+        meta_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3b57")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+        ]))
+        story += [meta_table, Spacer(1, 16), Paragraph("Calibration Ratings (0-10)", styles["Heading2"])]
+
+        score_rows = [["Metric", "Rating", "Detail"]] + [
+            [name, f"{val:.1f} / 10", detail] for name, val, detail in scores
+        ]
+        score_table = Table(score_rows, colWidths=[5 * cm, 3 * cm, 7 * cm])
+        score_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3b57")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+        ]))
+        story.append(score_table)
+
+        doc.build(story)
+        return buffer.getvalue(), "application/pdf", "pdf"
+    except Exception:
+        # Fallback: structured plain-text report (no external dependency).
+        lines = [
+            "AVL-STYLE EXECUTIVE CALIBRATION SUMMARY",
+            "=" * 44,
+            f"Generated: {generated}",
+            "",
+            "FILE METADATA",
+            "-" * 44,
+        ]
+        lines += [f"{k:<24}: {v}" for k, v in meta.items()]
+        lines += ["", "CALIBRATION RATINGS (0-10)", "-" * 44]
+        lines += [f"{name:<24}: {val:>4.1f} / 10   {detail}" for name, val, detail in scores]
+        text = "\n".join(lines) + "\n"
+        return text.encode("utf-8"), "text/plain", "txt"
 
 def calculate_response_delay(event_df, fs=100.0):
     """Calculates the exact dead-time (seconds) from pedal tip-in to vehicle physical acceleration."""
@@ -163,15 +276,16 @@ def calculate_response_delay(event_df, fs=100.0):
 # -----------------------------------------------------------------------------
 # 3. FILE PARSING PIPELINE
 # -----------------------------------------------------------------------------
-st.sidebar.markdown("### 🚗 Vehicle Calibration Target")
+st.sidebar.markdown("### 🚗 Vehicle Configuration Profile")
 vehicle_mode = st.sidebar.selectbox(
-    "Select vehicle mode",
+    "Vehicle Configuration Profile",
     options=list(MODE_PROFILES.keys()),
-    index=list(MODE_PROFILES.keys()).index("Comfort"),
+    index=list(MODE_PROFILES.keys()).index("Luxury Sedan"),
     help=(
-        "Sets how strictly drivability faults are scored. 'Sport' demands the "
-        "sharpest response (small faults cost more points), 'Eco' is the most "
-        "forgiving, and 'Comfort' sits in between."
+        "Sets the baseline against which drivability faults are scored. "
+        "'Sports Car' punishes response delay and disturbances far more "
+        "severely, 'Luxury Sedan' is a balanced baseline, and 'Eco EV' is the "
+        "most forgiving on latency."
     ),
 )
 profile = MODE_PROFILES[vehicle_mode]
@@ -217,7 +331,7 @@ if uploaded_file is not None:
         score_lf = max(1.0, min(10.0, 10.0 - (lf_rms * profile['lf'])))
         score_hf = max(1.0, min(10.0, 10.0 - (hf_rms * profile['hf'])))
         
-        st.markdown(f"### 📊 Vehicle Calibration Quality Overview — *{vehicle_mode} Mode*")
+        st.markdown(f"### 📊 Vehicle Calibration Quality Overview — *{vehicle_mode}*")
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         
         m_col1.metric("Surge Rating (0.5-2Hz)", f"{round(score_surge, 1)} / 10", f"RMS: {round(surge_rms, 3)} m/s²")
@@ -243,9 +357,44 @@ if uploaded_file is not None:
                 delays.append(calculate_response_delay(ev_df))
                 
         mean_delay = np.mean(delays) if delays else 0.0
-        # Response delay penalty scales with the selected vehicle mode.
+        # Response delay penalty scales with the selected vehicle profile.
         score_delay = max(1.0, min(10.0, 10.0 - (mean_delay * profile['delay'])))
         m_col4.metric("Response Delay Rating", f"{round(score_delay, 1)} / 10", f"Mean Lag: {int(mean_delay*1000)} ms")
+
+        # Overall calibration rating (mean of the four sub-scores).
+        score_overall = float(np.mean([score_surge, score_lf, score_hf, score_delay]))
+        st.metric("🏁 Overall Calibration Rating", f"{round(score_overall, 1)} / 10")
+
+        # -----------------------------------------------------------------------------
+        # 4b. AUTOMATED EXECUTIVE SUMMARY REPORT (sidebar export)
+        # -----------------------------------------------------------------------------
+        duration_s = float(df['timestamp'].iloc[-1] - df['timestamp'].iloc[0]) if len(df) else 0.0
+        report_meta = {
+            "Source File": uploaded_file.name,
+            "Vehicle Profile": vehicle_mode,
+            "Analysis Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Log Duration (s)": f"{duration_s:.1f}",
+            "Samples (100 Hz grid)": len(df),
+            "Tip-In Events Detected": len(tip_ins),
+            "Mean Response Lag (ms)": int(mean_delay * 1000),
+        }
+        report_scores = [
+            ("Overall Calibration", score_overall, "Mean of sub-ratings"),
+            ("Surge (0.5-2 Hz)", score_surge, f"RMS {surge_rms:.3f} m/s²"),
+            ("Disturbances LF (2-8 Hz)", score_lf, f"RMS {lf_rms:.3f} m/s²"),
+            ("Disturbances HF (8-20 Hz)", score_hf, f"RMS {hf_rms:.3f} m/s²"),
+            ("Response Delay", score_delay, f"Mean lag {int(mean_delay * 1000)} ms"),
+        ]
+        report_bytes, report_mime, report_ext = build_summary_report(report_meta, report_scores)
+        safe_stem = os.path.splitext(uploaded_file.name)[0]
+        st.sidebar.markdown("---")
+        st.sidebar.download_button(
+            "📥 Export AVL-Style Executive Summary Report",
+            data=report_bytes,
+            file_name=f"calibration_summary_{safe_stem}.{report_ext}",
+            mime=report_mime,
+            use_container_width=True,
+        )
 
         # -----------------------------------------------------------------------------
         # 5. DIAGNOSTIC GRAPH ARCHITECTURE
@@ -261,50 +410,34 @@ if uploaded_file is not None:
             st.plotly_chart(fig_low, use_container_width=True)
 
             # -----------------------------------------------------------------
-            # SURGE FREQUENCY MAPPING (Welch FFT over the surge tracking array)
+            # FREQUENCY MAPPING (Welch PSD) — Surge (0.5-2Hz) & LF (2-8Hz)
             # -----------------------------------------------------------------
-            st.markdown("#### 🔬 Surge Frequency Mapping (0.5–2.0 Hz)")
-            spectrum = compute_surge_spectrum(df['surge_signal'], fs=100.0, band=(0.5, 2.0))
-            if spectrum is None:
-                st.info("Surge slice too short to resolve a dominant frequency peak.")
-            else:
-                sf_col1, sf_col2 = st.columns([1, 2])
-                sf_col1.metric(
-                    "Dominant Surge Frequency",
-                    f"{spectrum['dominant_freq']:.2f} Hz",
-                    f"PSD peak: {spectrum['dominant_power']:.3e} (m/s²)²/Hz",
-                )
-                sf_col1.caption(spectrum['source'])
-
-                low, high = spectrum['band']
-                band_mask = (spectrum['freqs'] >= low) & (spectrum['freqs'] <= high)
-                fig_psd = go.Figure()
-                fig_psd.add_trace(go.Scatter(
-                    x=spectrum['freqs'][band_mask],
-                    y=spectrum['psd'][band_mask],
-                    name="Surge PSD",
-                    line=dict(color="orange"),
-                    fill="tozeroy",
-                ))
-                fig_psd.add_vline(
-                    x=spectrum['dominant_freq'],
-                    line=dict(color="crimson", dash="dash"),
-                    annotation_text=f"{spectrum['dominant_freq']:.2f} Hz",
-                    annotation_position="top",
-                )
-                fig_psd.update_layout(
-                    title="Surge Power Spectral Density (Welch)",
-                    xaxis_title="Frequency (Hz)",
-                    yaxis_title="PSD (m/s²)²/Hz",
-                    height=350,
-                )
-                sf_col2.plotly_chart(fig_psd, use_container_width=True)
+            st.markdown("#### 🔬 Frequency Mapping (Welch PSD)")
+            psd_col1, psd_col2 = st.columns(2)
+            surge_dom = render_psd_block(
+                psd_col1, df['surge_signal'], band=(0.5, 2.0),
+                title="Surge (0.5–2 Hz)", color="orange", fs=100.0,
+                caption_fn=interpret_surge_source,
+            )
+            lf_dom = render_psd_block(
+                psd_col2, df['disturbances_lf'], band=(2.0, 8.0),
+                title="Disturbances LF (2–8 Hz)", color="blue", fs=100.0,
+            )
             
         with tab2:
             fig_high = go.Figure()
             fig_high.add_trace(go.Scatter(x=df['timestamp'], y=df['disturbances_hf'], name="Disturbances HF (Harshness Components)", line=dict(color="crimson")))
             fig_high.update_layout(title="High-Frequency Signal Noise & Combustion Disturbance Profile", xaxis_title="Time (s)", yaxis_title="Acceleration (m/s²)", height=400)
             st.plotly_chart(fig_high, use_container_width=True)
+
+            # -----------------------------------------------------------------
+            # FREQUENCY MAPPING (Welch PSD) — HF harshness (8-20Hz)
+            # -----------------------------------------------------------------
+            st.markdown("#### 🔬 Harshness Frequency Mapping (Welch PSD)")
+            hf_dom = render_psd_block(
+                st, df['disturbances_hf'], band=(8.0, 20.0),
+                title="Disturbances HF (8–20 Hz)", color="crimson", fs=100.0,
+            )
             
         with tab3:
             if tip_ins:
