@@ -173,6 +173,8 @@ def render_single(df, found, result, cfg, dna, tx, transmission, filename):
 
     render_timeline(result.events)
     render_report_button(df, found, result, cfg, tx, transmission, filename)
+    render_calibration_advisor(result)
+    render_verification(df, result, dna)
     render_diagnostics(df, result, dna)
 
 
@@ -321,6 +323,175 @@ def render_benchmark(results_by_file, mode_weights):
 
 
 # =============================================================================
+# Calibration / Verification / Benchmark features
+# =============================================================================
+def render_calibration_advisor(result):
+    st.markdown("### 🛠️ Calibration Advisor")
+    mode_weights = st.session_state.mode_weights
+    base_overall, opps = avl.improvement_opportunities(result.mode_results, mode_weights)
+    if not opps:
+        st.success("All assessed criteria already meet the improvement target (≥ 9.0). "
+                   "No high-priority calibration actions.")
+    else:
+        st.caption("Ranked by how much the **overall** AVL-DRIVE Rating would rise if each "
+                   "criterion were lifted to 9.0 (accounts for the weight tree + extreme-value weighting).")
+        st.dataframe(pd.DataFrame([
+            {"Priority": i + 1, "Operation Mode": o["mode"], "Criterion": o["label"],
+             "Current DR": o["current_rating"], "Δ Overall if fixed": o["potential_gain"],
+             "Metric": f"{o['metric']:.3f} {o['unit']}", "Mode w": o["mode_weight"]}
+            for i, o in enumerate(opps[:12])]), use_container_width=True, hide_index=True)
+        top = opps[0]
+        st.info(f"**Top action — {top['mode']} · {top['label']}** "
+                f"(potential +{top['potential_gain']:.2f} overall DR)\n\n{top['hint']}")
+        with st.expander("Calibration lever hints for all flagged criteria"):
+            seen = set()
+            for o in opps:
+                if o["criterion"] in seen:
+                    continue
+                seen.add(o["criterion"])
+                st.markdown(f"- **{o['label']}** — {o['hint']}")
+
+    with st.expander("Target-gap table (all criteria vs a target DR)"):
+        target = st.slider("Target DRIVE Rating", 5.0, 10.0, 8.0, 0.5, key="advisor_target")
+        gaps = avl.target_gaps(result.mode_results, target)
+        st.dataframe(pd.DataFrame([
+            {"Operation Mode": g["mode"], "Criterion": g["criterion"], "DR": g["rating"],
+             "Gap to target": g["gap_to_target"], "Metric": f"{g['metric']:.3f} {g['unit']}"}
+            for g in gaps]), use_container_width=True, hide_index=True)
+
+
+def render_verification(df, result, dna):
+    st.markdown("### ✅ Drivability Verification (acceptance gate)")
+    preset = st.selectbox("Acceptance spec preset", list(avl.VERIFICATION_PRESETS.keys()),
+                          key="verif_preset")
+    base = avl.VERIFICATION_PRESETS[preset]
+    c1, c2, c3 = st.columns(3)
+    spec = {
+        "overall_min": c1.number_input("Overall DR ≥", 1.0, 10.0, float(base["overall_min"]), 0.5),
+        "mode_min": c2.number_input("Each mode DR ≥", 1.0, 10.0, float(base["mode_min"]), 0.5),
+        "criterion_min": c3.number_input("Each criterion DR ≥", 1.0, 10.0, float(base["criterion_min"]), 0.5),
+    }
+    verdict = avl.verify(result.overall, result.mode_results, spec)
+    if verdict["passed"]:
+        st.success(f"**PASS** — all {verdict['n_checks']} requirements met for '{preset}'.")
+    else:
+        st.error(f"**FAIL** — {verdict['n_fail']} of {verdict['n_checks']} requirements not met for '{preset}'.")
+
+    only_fail = st.checkbox("Show only failing requirements", value=True, key="verif_only_fail")
+    rows = [i for i in verdict["items"] if i["actual"] is not None and (not only_fail or not i["pass"])]
+    if rows:
+        st.dataframe(pd.DataFrame([
+            {"Requirement": i["requirement"], "Level": i["level"], "Actual DR": i["actual"],
+             "Target": i["target"], "Result": "PASS" if i["pass"] else "FAIL"} for i in rows]),
+            use_container_width=True, hide_index=True)
+    else:
+        st.caption("No failing requirements to show.")
+
+    log = avl.issue_log(df, result.events, dna, criterion_min=spec["criterion_min"])
+    st.markdown("#### 🚩 Worst-event issue log")
+    if log:
+        st.dataframe(pd.DataFrame([
+            {"Operation Mode": r["mode"], "Start [s]": r["t_start"], "End [s]": r["t_end"],
+             "Event DR": r["event_dr"], "Worst criterion": avl.CRITERIA_META.get(r["worst_criterion"], {}).get("label", r["worst_criterion"]),
+             "Worst DR": r["worst_rating"]} for r in log]),
+            use_container_width=True, hide_index=True)
+    else:
+        st.caption("No individual events below the criterion threshold.")
+
+    verif_payload = {"preset": preset, "spec": spec, "passed": verdict["passed"],
+                     "n_fail": verdict["n_fail"], "n_checks": verdict["n_checks"],
+                     "items": verdict["items"]}
+    st.download_button("📥 Export verification result (JSON)",
+                       data=json.dumps(verif_payload, indent=2),
+                       file_name="drivability_verification.json", mime="application/json",
+                       key="verif_dl")
+
+
+def _radar(modes, series):
+    fig = go.Figure()
+    for name, vals in series.items():
+        r = [v if v is not None else 0 for v in vals]
+        if not r:
+            continue
+        fig.add_trace(go.Scatterpolar(r=r + [r[0]], theta=modes + [modes[0]],
+                                      fill="toself", name=name))
+    fig.update_layout(polar=dict(radialaxis=dict(range=[0, 10], visible=True)),
+                      height=480, title="Drivability fingerprint — per-mode DRIVE Rating",
+                      showlegend=True)
+    return fig
+
+
+def render_benchmark_library(current_ref):
+    st.markdown("## 📚 Benchmark Library")
+    if "benchmark_library" not in st.session_state:
+        st.session_state.benchmark_library = []
+    lib = st.session_state.benchmark_library
+
+    c1, c2 = st.columns([2, 1])
+    ref_name = c1.text_input("Reference name", value=current_ref["name"], key="ref_name")
+    if c2.button("➕ Save current as reference"):
+        rec = dict(current_ref)
+        rec["name"] = ref_name or current_ref["name"]
+        st.session_state.benchmark_library = [r for r in lib if r["name"] != rec["name"]] + [rec]
+        lib = st.session_state.benchmark_library
+        st.success(f"Saved reference '{rec['name']}' ({len(lib)} in library).")
+
+    up = st.file_uploader("Import benchmark library (JSON)", type=["json"], key="lib_up")
+    if up is not None:
+        try:
+            imported = avl.library_from_json(up.getvalue().decode("utf-8"))
+            names = {r["name"] for r in lib}
+            st.session_state.benchmark_library = lib + [r for r in imported if r["name"] not in names]
+            lib = st.session_state.benchmark_library
+            st.success(f"Imported {len(imported)} reference(s).")
+        except Exception as e:
+            st.error(f"Invalid library file: {e}")
+
+    compare_set = [current_ref] + [r for r in lib if r["name"] != current_ref["name"]]
+    if len(compare_set) >= 1:
+        modes, series = avl.fingerprint(compare_set)
+        if modes:
+            st.plotly_chart(_radar(modes, series), use_container_width=True)
+    if lib:
+        st.markdown("### 🏆 Reference ranking")
+        st.dataframe(pd.DataFrame(avl.ranking([current_ref] + lib)),
+                     use_container_width=True, hide_index=True)
+        st.download_button("📥 Export benchmark library (JSON)",
+                           data=avl.library_to_json(lib), file_name="benchmark_library.json",
+                           mime="application/json")
+    else:
+        st.caption("Save references to build a best-in-class benchmark library.")
+
+
+def render_ab_compare(results_by_file):
+    st.markdown("## 🔀 A/B Calibration Comparison (regression check)")
+    names = list(results_by_file.keys())
+    c1, c2, c3 = st.columns(3)
+    a = c1.selectbox("Baseline (A)", names, index=0, key="ab_a")
+    b = c2.selectbox("Candidate (B)", names, index=min(1, len(names) - 1), key="ab_b")
+    thr = c3.number_input("Regression threshold [DR]", 0.1, 3.0, 0.5, 0.1, key="ab_thr")
+    if a == b:
+        st.caption("Select two different measurements to compare.")
+        return
+    cmp = avl.compare_results(results_by_file[a]["result"], results_by_file[b]["result"], thr)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Overall Δ (B − A)", f"{cmp['overall_delta']:+.2f}" if cmp["overall_delta"] is not None else "—",
+              cmp["overall_verdict"])
+    m2.metric("Modes improved", cmp["n_improvements"])
+    m3.metric("Modes regressed", cmp["n_regressions"])
+    st.markdown("### Per-operation-mode change")
+    st.dataframe(pd.DataFrame([
+        {"Operation Mode": r["mode"], f"A · {a}": r["a"], f"B · {b}": r["b"],
+         "Δ (B−A)": r["delta"], "Verdict": r["verdict"]} for r in cmp["mode_rows"]],),
+        use_container_width=True, hide_index=True)
+    with st.expander("Per-criterion change"):
+        st.dataframe(pd.DataFrame([
+            {"Operation Mode": r["mode"], "Criterion": r["criterion"], f"A": r["a"], f"B": r["b"],
+             "Δ (B−A)": r["delta"], "Verdict": r["verdict"]} for r in cmp["criterion_rows"]]),
+            use_container_width=True, hide_index=True)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -359,6 +530,8 @@ def main():
     if len(results_by_file) > 1:
         render_benchmark(results_by_file, mode_weights)
         st.markdown("---")
+        render_ab_compare(results_by_file)
+        st.markdown("---")
         sel = st.selectbox("Detailed view for measurement", list(results_by_file.keys()))
     else:
         sel = next(iter(results_by_file))
@@ -368,6 +541,10 @@ def main():
     with st.sidebar.expander("Resolved channel mapping"):
         st.write(r["found"])
     render_single(r["df"], r["found"], r["result"], cfg, dna, tx, transmission, sel)
+
+    st.markdown("---")
+    current_ref = avl.result_to_reference(sel, transmission, cfg["brand"], r["result"])
+    render_benchmark_library(current_ref)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,21 @@ on top of a reusable, unit-tested Python engine (`avldrive`).
   **microscope**, **statistical trend** views, cached processing, and a
   one-click **PDF executive report**.
 
+### Engineering workflows
+
+- **Calibration Advisor** — ranks criteria by *improvement potential* (how much
+  the overall DR rises if each is lifted to target, through the weight tree),
+  gives target-gap tables and root-cause → calibration-lever hints
+  (anti-jerk/lash, torque ramp, lock-up, mount isolation, shift handover…).
+- **Drivability Verification** — acceptance-spec presets (Production sign-off /
+  Development milestone / Prototype) with editable thresholds, a PASS/FAIL gate,
+  a requirement table and a **worst-event issue log**; exportable verdict.
+- **Benchmark Library** — save assessments as named references (best-in-class),
+  import/export the library as JSON, view a **drivability fingerprint** radar
+  and a ranking table.
+- **A/B comparison** — baseline-vs-candidate calibration diff at overall,
+  operation-mode and criterion level with **regression/improvement** flags.
+
 ## Project layout
 
 ```
@@ -43,6 +58,10 @@ avldrive/                 Reusable, Streamlit-free engine
   operation_modes.py      Trigger engine / operation-mode detection
   assessment.py           Weighted + extreme-value DRIVE-Rating aggregation
   spectrum.py             Welch PSD mapping
+  advisor.py              Calibration Advisor (priority ranking + lever hints)
+  verification.py         Acceptance specs, PASS/FAIL gate, issue log
+  benchmark.py            Reference library, fingerprint, ranking
+  compare.py              A/B regression comparison
   reporting.py            PDF / text executive summary
   pipeline.py             load_measurement + run_assessment orchestration
 app.py                    Streamlit UI (presentation only)
