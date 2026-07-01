@@ -19,12 +19,18 @@ from .operation_modes import detect_events
 
 
 class MissingChannelsError(RuntimeError):
-    """Raised when the measurement lacks the required DRIVE channels."""
+    """Raised when the measurement lacks the required DRIVE channels.
 
-    def __init__(self, missing, detected):
+    ``available`` holds every raw channel name in the file so the UI can offer a
+    manual mapping.
+    """
+
+    def __init__(self, missing, available):
         self.missing = missing
-        self.detected = detected
-        super().__init__(f"Missing required DRIVE channels: {missing}. Detected: {detected}")
+        self.available = list(available)
+        super().__init__(
+            f"Missing required DRIVE channels: {missing}. "
+            f"The file has {len(self.available)} channels — map them manually.")
 
 
 def _close_quietly(obj):
@@ -49,9 +55,31 @@ def _remove_quietly(path: str, retries: int = 5, delay: float = 0.2):
             time.sleep(delay)
 
 
-def load_measurement(path: str, cfg: dict):
+def list_channels(path: str) -> list[str]:
+    """Return every raw channel name in a measurement file (sorted, unique)."""
+    mdf = MDF(path)
+    try:
+        return sorted(set(mdf.channels_db.keys()))
+    finally:
+        _close_quietly(mdf)
+
+
+def list_channels_from_bytes(data: bytes, suffix: str) -> list[str]:
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix or ".mf4")
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(data)
+        return list_channels(tmp_path)
+    finally:
+        _remove_quietly(tmp_path)
+
+
+def load_measurement(path: str, cfg: dict, mapping: dict | None = None):
     """Import an .mf4/.dat file, resample to the 100 Hz grid, rename to AVL
     logical channels and build calculated channels. Returns ``(df, found)``.
+
+    ``mapping`` optionally overrides channel resolution (logical -> raw); only
+    entries whose raw channel actually exists are kept.
 
     The source ``MDF`` (and intermediate filtered/resampled objects) are always
     closed before returning so the underlying file is released — critical on
@@ -60,10 +88,12 @@ def load_measurement(path: str, cfg: dict):
     mdf = MDF(path)
     filtered = res = None
     try:
-        found = resolve_channels(mdf)
+        found = dict(mapping) if mapping else resolve_channels(mdf)
+        # Keep only mappings whose raw channel is present in the file.
+        found = {lg: raw for lg, raw in found.items() if raw in mdf.channels_db}
         missing = [c for c in REQUIRED_LOGICAL if c not in found]
         if missing:
-            raise MissingChannelsError(missing, sorted(found.keys()))
+            raise MissingChannelsError(missing, sorted(mdf.channels_db.keys()))
         filtered = mdf.filter(list(found.values()))
         res = filtered.resample(raster=1.0 / FS)
         # ``.copy()`` materializes the data so it stays valid after the MDF (and
@@ -81,14 +111,14 @@ def load_measurement(path: str, cfg: dict):
     return df, found
 
 
-def load_measurement_from_bytes(data: bytes, suffix: str, cfg: dict):
+def load_measurement_from_bytes(data: bytes, suffix: str, cfg: dict, mapping: dict | None = None):
     """Convenience wrapper for in-memory uploads. Writes a temp file, imports it
     and always cleans up (best-effort, Windows-safe)."""
     fd, tmp_path = tempfile.mkstemp(suffix=suffix or ".mf4")
     try:
         with os.fdopen(fd, "wb") as tmp:
             tmp.write(data)
-        return load_measurement(tmp_path, cfg)
+        return load_measurement(tmp_path, cfg, mapping)
     finally:
         _remove_quietly(tmp_path)
 

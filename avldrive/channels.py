@@ -7,20 +7,27 @@ from .config import CHANNEL_CANDIDATES, FS, G
 from .dsp import LP
 
 
-def resolve_channels(mdf) -> dict[str, str]:
-    """Map available raw channels to AVL logical channels using candidate lists."""
-    available = list(mdf.channels_db.keys())
-    lower = {name.lower(): name for name in available}
+def resolve_channel_names(names) -> dict[str, str]:
+    """Map a list of raw channel names to AVL logical channels via candidate
+    lists (exact match first, then case-insensitive). Returns logical -> raw."""
+    names = list(names)
+    lower = {name.lower(): name for name in names}
+    names_set = set(names)
     found: dict[str, str] = {}
     for logical, cands in CHANNEL_CANDIDATES.items():
         for c in cands:
-            if c in mdf.channels_db:
+            if c in names_set:
                 found[logical] = c
                 break
             if c.lower() in lower:
                 found[logical] = lower[c.lower()]
                 break
     return found
+
+
+def resolve_channels(mdf) -> dict[str, str]:
+    """Map available raw channels to AVL logical channels using candidate lists."""
+    return resolve_channel_names(list(mdf.channels_db.keys()))
 
 
 def build_calculated_channels(df, cfg: dict):

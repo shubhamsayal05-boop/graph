@@ -30,14 +30,58 @@ st.set_page_config(page_title="AVL-DRIVE-Style Drivability Lab", layout="wide",
 # Cached processing
 # =============================================================================
 @st.cache_data(show_spinner=False)
+def inspect_channels(file_bytes: bytes, filename: str):
+    """List every raw channel in a measurement (cached)."""
+    suffix = os.path.splitext(filename)[1] or ".mf4"
+    return avl.list_channels_from_bytes(file_bytes, suffix)
+
+
+@st.cache_data(show_spinner=False)
 def process_file(file_bytes: bytes, filename: str, cfg: dict, dna: dict,
-                 mode_weights: dict, criteria_weights: dict, enabled_modes: tuple):
+                 mode_weights: dict, criteria_weights: dict, enabled_modes: tuple,
+                 mapping: dict):
     """Import + assess a single measurement (cached on all inputs)."""
     suffix = os.path.splitext(filename)[1] or ".mf4"
-    df, found = avl.load_measurement_from_bytes(file_bytes, suffix, cfg)
+    df, found = avl.load_measurement_from_bytes(file_bytes, suffix, cfg, mapping)
     result = avl.run_assessment(df, list(enabled_modes), cfg, dna,
                                 mode_weights, criteria_weights)
     return df, found, result
+
+
+def channel_mapper(filename: str, available: list[str], auto: dict) -> dict:
+    """Interactive logical→raw channel mapping. Returns the effective mapping.
+
+    Defaults to auto-resolved channels; the expander opens automatically when a
+    required channel is unmapped so the engineer can pick the right signal.
+    """
+    from avldrive.config import CHANNEL_CANDIDATES, REQUIRED_LOGICAL
+    key = f"map_{filename}"
+    prev = st.session_state.get(key, {})
+    effective = {**auto, **{k: v for k, v in prev.items() if v}}
+    missing = [c for c in REQUIRED_LOGICAL if c not in effective]
+
+    with st.expander(f"🔌 Channel mapping — {filename}  ({len(available)} channels)",
+                     expanded=bool(missing)):
+        if missing:
+            st.warning("Required channels not auto-detected: " + ", ".join(missing) +
+                       ". Map them to the correct raw channels below.")
+        with st.expander("Browse all channels in file"):
+            st.dataframe(pd.DataFrame({"Channel": available}), use_container_width=True,
+                         hide_index=True, height=240)
+        options = ["(none)"] + available
+        order = REQUIRED_LOGICAL + [c for c in CHANNEL_CANDIDATES if c not in REQUIRED_LOGICAL]
+        mapping: dict[str, str] = {}
+        cols = st.columns(2)
+        for i, logical in enumerate(order):
+            default = prev.get(logical) or auto.get(logical)
+            idx = options.index(default) if default in options else 0
+            required_tag = " *" if logical in REQUIRED_LOGICAL else ""
+            sel = cols[i % 2].selectbox(f"{logical}{required_tag}", options, index=idx,
+                                        key=f"{key}_{logical}")
+            if sel != "(none)":
+                mapping[logical] = sel
+        st.session_state[key] = mapping
+    return mapping
 
 
 # =============================================================================
@@ -513,11 +557,26 @@ def main():
                 "Upload several to benchmark them side by side.")
         return
 
+    from avldrive.config import REQUIRED_LOGICAL
     results_by_file = {}
     for up in uploads:
         try:
+            available = inspect_channels(up.getvalue(), up.name)
+        except Exception as e:  # pragma: no cover - defensive UI guard
+            st.error(f"**{up.name}** — could not read channels: {e}")
+            continue
+
+        auto = avl.resolve_channel_names(available)
+        mapping = channel_mapper(up.name, available, auto)
+        missing = [c for c in REQUIRED_LOGICAL if c not in mapping]
+        if missing:
+            st.warning(f"**{up.name}** — waiting for channel mapping "
+                       f"(required: {', '.join(missing)}).")
+            continue
+        try:
             df, found, result = process_file(up.getvalue(), up.name, cfg, dna,
-                                             mode_weights, criteria_weights, tuple(tx["modes"]))
+                                             mode_weights, criteria_weights,
+                                             tuple(tx["modes"]), mapping)
             results_by_file[up.name] = {"df": df, "found": found, "result": result}
         except avl.MissingChannelsError as e:
             st.error(f"**{up.name}** — {e}")

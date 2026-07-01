@@ -39,6 +39,26 @@ def test_bev_excludes_engine_modes(synthetic_mf4):
     assert "Idle" not in res.mode_results
 
 
+def test_resolve_channel_names_case_insensitive():
+    from avldrive import resolve_channel_names
+    names = ["acceleratorpedal", "Accel_Filt_X", "veh_Spd_Kph", "UnrelatedSignal"]
+    found = resolve_channel_names(names)
+    assert found["AcceleratorPedal"] == "acceleratorpedal"
+    assert found["AccelerationChassis"] == "Accel_Filt_X"
+    assert found["VehicleSpeed"] == "veh_Spd_Kph"
+
+
+def test_manual_mapping_overrides_resolution(synthetic_mf4):
+    # Force pedal to map from a non-standard channel via explicit mapping.
+    from avldrive import list_channels, load_measurement
+    names = list_channels(synthetic_mf4)
+    assert "AcceleratorPedal" in names
+    mapping = {"AcceleratorPedal": "AcceleratorPedal", "AccelerationChassis": "AccelerationChassis"}
+    df, found = load_measurement(synthetic_mf4, _cfg("AT"), mapping=mapping)
+    assert found["AcceleratorPedal"] == "AcceleratorPedal"
+    assert "AccelerationChassisCompensated" in df.columns
+
+
 def test_transmission_changes_enabled_modes():
     at = set(TRANSMISSION_CONFIG["AT"]["modes"])
     bev = set(TRANSMISSION_CONFIG["BEV"]["modes"])
